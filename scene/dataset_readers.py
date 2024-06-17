@@ -254,7 +254,80 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def readCamerasFromNpy(path, white_background, extension=".png"):
+    """Modification from readCameraFromNpy; The npy file is rendered with https://github.com/allenai/objaverse-xl/blob/main/scripts/rendering/blender_script.py  """
+    # fovx/fovy is shared across all cameras
+    sensor_width = 32.0 #mm
+    focal_length = 35.0 #mm
+    FovX = 2 * np.arctan(sensor_width / (2 * focal_length)) # radius
+    FovY = FovX
+
+    cam_infos = []
+
+    npy_files = [f for f in os.listdir(path) if f.endswith(".npy")]
+
+    for idx, npy_file in enumerate(npy_files):
+        fname = npy_file.split(".")[0]
+        cam_name = os.path.join(path, fname + extension)
+
+        w2c = np.load(os.path.join(path, npy_file))
+        # Change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward); Is this necessary?
+        # w2c_homo = np.vstack([w2c, np.array([[0, 0, 0, 1]])])
+        # c2w_before = np.linalg.inv(w2c_homo)
+        # c2w_after = c2w_before.copy()
+        # c2w_after[:3, 1:3] *= -1 # Change the sign in Y, Z;
+        # w2c_correct = np.linalg.inv(c2w_after)
+        # However, because you're now reflecting the camera in the world, you need to apply the transformation to the rows of the matrix instead of the columns. Here's how you can do it:
+        w2c[1:3, :4] *= -1 # 
+
+        # # get the world-to-camera transform and set R, T
+        R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+
+        T = w2c[:3, 3]
+
+        image_path = os.path.join(path, cam_name)
+        image_name = Path(cam_name).stem
+        image = Image.open(image_path)
+
+        im_data = np.array(image.convert("RGBA"))
+
+        bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+        norm_data = im_data / 255.0
+        arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+        image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                        image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+            
+    return cam_infos
+
+def readObjaverseSceneInfo(path, white_background, eval=False, extension=".png"):
+    print("Reading Transforms")
+    train_cam_infos = readCamerasFromNpy(path, white_background, extension)
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+        # Since this data set has no colmap data, we start with random points
+    num_pts = 100_000
+    print(f"Generating random point cloud ({num_pts})...")
+    
+    # We create random points inside the bounds of the synthetic Blender scenes
+    xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+    shs = np.random.random((num_pts, 3)) / 255.0
+    pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+    storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=[],
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Objaverse" : readObjaverseSceneInfo,
 }
